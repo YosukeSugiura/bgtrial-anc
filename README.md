@@ -28,6 +28,20 @@ The simulations run on the CPU. The full evaluation (20 seeds × 5 noise classes
 | `atsip/explore/paper/` | Scripts that produce the figures and tables of the paper from `out/` |
 | `atsip/oracle/`, `atsip/explore/theory/` | Reference and analysis modules imported by the evaluation |
 
+## Where the proposed algorithm is implemented
+
+All paths are in `atsip/explore/`.
+
+| Part (paper) | Code |
+|---|---|
+| Block loop of the frequency-domain FxNLMS | `final.py`, `simulate` |
+| Spectral-factor direction (Section 4) | `final.py`, `sf_factor` and `sf_dir_cached` |
+| Step size divided by max(g_n, g_min), early and late phases | `prop2.py`, `P2` and `mu_late` |
+| Reconstructed error frame | `prop2.py`, `Frame`, and `final.py`, `SwitchedFrame` |
+| Trial detector z_n with the guard interval | `protoC.py`, `RSNDetector`, and `det2.py`, `FreezeDetector` |
+| Background trial and decisions ρ_n (discard, early transfer, final transfer) | `prop5.py`, `P5`, and `final.py`, `P5Cap` |
+| Assembly of the proposed algorithm (`P5-early-cap`) | `final.py`, `run_rule`, with `final2.configure()` installing `FreezeDetector` |
+
 ## Reproducing the paper
 
 Regenerate the figures and tables from the stored results:
