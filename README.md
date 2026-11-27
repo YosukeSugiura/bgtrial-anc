@@ -56,7 +56,7 @@ Other experiments of the paper:
 |---|---|
 | Comparison algorithms (C-FxLMS, MFxNLMS, dual-threshold FxLMS, APFM) | `cc.py`, `cc_class.py`, `mfx.py`, `thx.py`, `apfm.py` |
 | Frozen-coefficient noise reduction | `frozen5.py` |
-| Variants without trials or detector | `ablate.py` |
+| Variants of the proposed algorithm | `final2.py` (rules other than `P5-early-cap`) |
 | Sensitivity to the detector threshold | `sens.py` |
 | Secondary-path model error | `smodel.py` |
 | Machine gun noise | `mgun.py` |
@@ -65,15 +65,36 @@ Other experiments of the paper:
 | Computational cost | `cost.py` |
 | Paired seed-bootstrap intervals | `paired_ci.py` |
 
-Each script prints its subcommands with `-h`. The settings of the proposed algorithm are fixed in `EVAL_FROZEN.json` and `TUNE*.json`. These settings were chosen without the evaluation seeds 100–119.
+Each script prints its subcommands with `-h`. The settings of the proposed algorithm were chosen on the design seeds 10–49, and the step sizes of the comparison algorithms on the seeds 10–14. `EVAL_FROZEN.json` records the SHA-256 of the evaluated files. The scripts refuse the seeds 100–119 without this file.
 
-A quick check reruns one case and compares it with the stored result:
+A quick check reruns one case in a scratch folder and compares it with the stored result:
 
 ```python
+import json, pathlib, tempfile
 import final2, final as F
 final2.configure()
-F.run_final_job(("G", "RS-far", 100, False))   # writes out/final2_run/G_RS-far_s100.json
+tmp = pathlib.Path(tempfile.mkdtemp())
+F.final_dir = lambda dry: tmp
+F.run_final_job(("G", "RS-far", 100, False))
+new = json.loads((tmp / "G_RS-far_s100.json").read_text())["rows"]
+old = json.loads(pathlib.Path("out/final2_run/G_RS-far_s100.json").read_text())["rows"]
+print(all(a[k] == b[k] for a, b in zip(new, old) for k in ("L1_whole", "rec_blocks", "div")))
 ```
+
+## Labels in the code
+
+| Code | Paper |
+|---|---|
+| `P5-early-cap` | Proposed |
+| `nors-cap` | Without trials |
+| `P5-early-noG` | Proposed without 1/g |
+| `P4-cap` | Immediate restart |
+| `TP-always-cap` | Always-on background trial |
+| `ND-always-cap` | Always reconstructed error |
+| `SF-fix` | Fixed-step SF |
+| `Freq_FxNLMS_CohVSS` | CohVSS-FxNLMS |
+| `G`, `II300`, `a145`, `a120` | Gaussian, Gaussian with isolated impulses, α-stable (α = 1.45, 1.20) |
+| `stat`, `RS-near`, `RS-far`, `EN0`, `ENm10` | No change, close source, far source, disturbance at 0 dB and −10 dB |
 
 ## Data
 
