@@ -4,6 +4,7 @@ title: "Background trial filter for active impulsive noise control"
 version: 1.0.0
 date-released: 2026-11-27
 license: MIT
+doi: 10.5281/zenodo.24589368
 repository-code: "https://github.com/YosukeSugiura/bgtrial-anc"
 authors:
   - family-names: Sugiura

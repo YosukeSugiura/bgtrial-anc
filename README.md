@@ -1,5 +1,7 @@
 # Background trial filter for active impulsive noise control
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24589368.svg)](https://doi.org/10.5281/zenodo.24589368)
+
 Code and aggregated results for
 
 > Y. Sugiura, "Fast Reconvergence in Active Impulsive Noise Control Using a Background Trial Filter," submitted to *APSIPA Transactions on Signal and Information Processing*.
@@ -122,4 +124,4 @@ The code is released under the MIT License (see `LICENSE`). The MeshRIR subset i
 
 ## Citation
 
-Please cite the paper and this software (see `CITATION.cff`).
+Please cite the paper and this software, <https://doi.org/10.5281/zenodo.24589368> (see `CITATION.cff`).
