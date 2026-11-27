@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Background trial filter for active impulsive noise control"
+version: 1.0.0
+date-released: 2026-11-27
+license: MIT
+repository-code: "https://github.com/YosukeSugiura/bgtrial-anc"
+authors:
+  - family-names: Sugiura
+    given-names: Yosuke
+    affiliation: Meiji University
+    orcid: "https://orcid.org/0000-0002-8415-4482"
+keywords: [active noise control, impulsive noise, FxNLMS, reconvergence]

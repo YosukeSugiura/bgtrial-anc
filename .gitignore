@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+atsip/explore/data/raw/
+atsip/explore/data/prepared/
+atsip/explore/paper/fig/
+.final2-report-*/
+atsip/explore/paper/tab/*.md

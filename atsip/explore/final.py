@@ -1,0 +1,1504 @@
+"""Final evaluation on measured paths (EVAL_PLAN.md).  Stage S1: scenario builder, simulators, measures, pilot.
+
+Paths: MeshRIR pairs in data/paths16 (P, S, P_near, P_far, P_<d>cm, S_<d>cm; 16 kHz, common delay removed).
+The plant uses the full responses; the controller uses the model S-hat = first Ls taps of S.  P and S of each pair
+are scaled so that ||P|| and ||S|| equal those of the default paths (keeps unnormalised baselines in their range).
+
+Scenarios (change at 15 s = block 1875):
+  stat                 no change
+  RS-near, RS-far      the noise source switches: P changes, S and S-hat stay
+  RM-<d>               the error microphone moves d cm: P and S change, S-hat is replaced by the new one
+  RM-<d>s              the same with the old S-hat kept (stale)
+  EN0, ENm10           bursts at the error microphone at 10 s and 20 s (0 / -10 dB re d), no path change
+  post:<scenario>      the paths (and model) after the change, used from the start (level reference for recovery)
+
+Methods: the frozen rule and its variants run in a block simulator with the same arithmetic as vssT_lib.simulate
+(without the Phi-excess, which needs the default paths); the external methods of algorithms/algorithms.py run in a
+per-sample loop.  Seeds 100-119 are refused until EVAL_FROZEN.json exists and --final is given.
+
+Commands (resumable):
+  python final.py check
+  python final.py pilot [--procs K] [--smoke]
+  python final.py report
+"""
+import argparse
+import copy
+import json
+import math
+import os
+import sys
+import time
+from multiprocessing import Pool
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))
+
+import ablate as ab
+import fastbase
+import prop2 as q
+import prop4 as q4
+import prop5 as q5
+import protoC as p
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy.io import wavfile
+from algorithms.algorithms import make_algo
+from data.diag_band import error_peak
+
+np, T = p.np, p.T
+B, M, N, FS, BPS = p.B, p.M, p.N, p.FS, p.BPS
+L_SIG = p.O.N_NOISE
+CB = 15 * BPS                                  # block of the change
+REAL = ("machinegun", "factory1", "destroyerengine", "volvo", "valve", "jackhammer")
+SYNTH = ("G", "PS", "BU", "II300", "a145", "a120")
+BURSTS = ((10.0, 10.5), (20.0, 20.5))
+DIV_GAIN = 1e4                                 # block error power above this x the full-run primary power = divergence
+VERSION = 4
+HP_HZ = 100.0                                  # operating band: 4th-order Butterworth high-pass on every excitation
+RMODES = ("fd",)                               # S1: "td" gave no gain and broke the identity with no-restart; dropped
+
+BASE = {  # name: (default step, parameters) from config.json / repro/config_a145.json
+    "FxNLMS": (0.3, {}),
+    "Th_FxNLMS": (0.3, {"c1": -200.0, "c2": 200.0}),
+    "FxlogNLMS": (0.5, {"G_l": 10000.0}),
+    "MFxLMM": (0.001, {"eps_l": 0.001, "gzai_l": 0.05, "lmd_l": 0.99}),
+    "FxNFLOC": (0.1, {"Ne": 512, "Nx": 512, "eps": 1e-12, "omega": 0.01}),
+    "EVSS_FxeLMS": (0.05, {"alpha": 1.0, "gamma": 0.0001, "k": 0.2, "lmd_e": 0.99}),
+    "FreqFxLMS": (0.36, {"M": 512, "BlockSize": 128, "eps": 1e-06}),
+    "Freq_FxNLMS_CohVSS": (0.36, {"M": 512, "BlockSize": 128, "eps": 1e-06, "rg_alpha": 0.05, "coh_pivot": 0.35,
+                                  "mu_scale_min": 0.6, "mu_scale_max": 1.3, "boost_power": 0.6, "suppress_power": 1.6,
+                                  "coh_gain": 1.5, "coh_weight_mix": 0.6, "coh_weight_power": 1.6,
+                                  "coh_weight_min": 0.55, "grad_norm_mix": 0.45}),
+}
+RULES = ("nors", "P5-early", "P5-early-noG", "P4", "TP-always", "ND-always", "SF-fix")
+
+
+# ----------------------------------------------------------------------------------------------
+# Inputs and scenarios
+# ----------------------------------------------------------------------------------------------
+def guard_seed(seed, final=False):
+    if 100 <= int(seed) <= 119 and not (final and (HERE / "EVAL_FROZEN.json").exists()):
+        raise SystemExit("seeds 100-119 are reserved for the final run (EVAL_FROZEN.json and --final are required)")
+
+
+def excitation(cls, seed):
+    """Filter each excitation before matching real-audio power to filtered G."""
+    x = highpass(_excitation(cls, seed))
+    return x * np.sqrt(g_power() / np.mean(x ** 2)) if cls in REAL else x
+
+
+def highpass(x):
+    return p.signal.sosfilt(p.signal.butter(4, HP_HZ, "highpass", fs=FS, output="sos"), x)
+
+
+def _excitation(cls, seed):
+    if cls in REAL:
+        fs, wav = wavfile.read(HERE / "data" / "prepared" / f"{cls}.wav")
+        assert fs == FS and wav.ndim == 1, (cls, fs, wav.shape)
+        off = (int(seed) % 5) * 2 * FS
+        x = np.asarray(wav[off:off + L_SIG], float)
+        assert len(x) == L_SIG, (cls, len(wav))
+        return x
+    if cls == "G":
+        return p.IC.make_input("A", seed)
+    if cls == "PS":
+        return p.IC.make_input("B", seed)
+    if cls == "BU":
+        return p.IC.make_input("C", seed)
+    if cls == "II300":
+        return T.impulses(seed, 300.0)
+    if cls == "a145":
+        return p.O.cms_symmetric_stable(1.45, L_SIG, seed)
+    if cls == "a120":
+        return p.O.cms_symmetric_stable(1.2, L_SIG, seed)
+    raise ValueError(cls)
+
+
+_GP = []
+
+
+def g_power():
+    if not _GP:
+        _GP.append(float(np.mean(highpass(_excitation("G", 10)) ** 2)))
+    return _GP[0]
+
+
+def load_pair(k):
+    z = np.load(HERE / "data" / "paths16" / f"pair_{k:02d}.npz")
+    gp = float(np.linalg.norm(T.BS.hP) / np.linalg.norm(z["P"]))
+    gs = float(np.linalg.norm(T.BS.hS) / np.linalg.norm(z["S"]))
+    return {key: np.asarray(z[key], float) * (gp if key.startswith("P") else gs) for key in z.files if key != "fs"}
+
+
+def paths_of(scen, pair):
+    """(P0, S0, model source 0), (P1, S1, model source 1) or None."""
+    P, S = pair["P"], pair["S"]
+    post = scen.startswith("post:")
+    s = scen[5:] if post else scen
+    if s in ("stat", "EN0", "ENm10"):
+        assert not post
+        return (P, S, S), None
+    if s in ("RS-near", "RS-far"):
+        new = (pair["P_" + s[3:]], S, S)
+    elif s.startswith("RM-"):
+        stale = s.endswith("s"); d = s[3:-1] if stale else s[3:]
+        new = (pair[f"P_{d}cm"], pair[f"S_{d}cm"], S if stale else pair[f"S_{d}cm"])
+    else:
+        raise ValueError(scen)
+    return (new, None) if post else ((P, S, S), new)
+
+
+def build(cls, scen, seed, Ls, rmode="fd", final=False):
+    """Data dictionary for the simulators.  rmode: 'fd' = filtered reference by the N-point product (as before);
+    'td' = spectrum of the time-domain filtered reference."""
+    guard_seed(seed, final)
+    if rmode not in ("fd", "td") or not 0 < Ls <= N:
+        raise ValueError((rmode, Ls))
+    x = excitation(cls, seed)
+    pair = load_pair(int(seed) % 8 + 1)
+    a, b = paths_of(scen, pair)
+    lf = p.signal.lfilter
+    n0 = CB * B
+    d = lf(a[0], [1.0], x); m0 = a[2][:Ls].copy(); r = lf(m0, [1.0], x)
+    plant, model, changes = [(0, a[1])], [(0, m0)], []
+    filtered = [(0, r)]
+    if b is not None:
+        d = np.concatenate([d[:n0], lf(b[0], [1.0], x)[n0:]])
+        m1 = b[2][:Ls].copy()
+        if b[1] is not a[1]:
+            plant.append((CB, b[1]))
+        if not np.array_equal(m1, m0):
+            model.append((CB, m1))
+            r1 = lf(m1, [1.0], x)
+            filtered.append((CB, r1))
+            r = np.concatenate([r[:n0], r1[n0:]])
+        changes = [CB]
+    Sf = np.fft.rfft(m0, N); S2 = np.abs(Sf) ** 2
+    dd = dict(x=x, d=d, r=r, xq=np.concatenate([np.zeros(N), x]), hS=a[1], hS_seq=plant, hSm_seq=model, Sf=Sf,
+              S2=S2 / S2.mean(), filtered=filtered, rmode=rmode, primary_power=float(np.mean(d ** 2)), pc=False, changes=changes, tag=f"{cls}|{scen}|s{seed}|L{Ls}|{rmode}", events=[])
+    if scen in ("EN0", "ENm10"):
+        q.error_noise(dd, int(seed), 0.0 if scen == "EN0" else -10.0, spans=BURSTS)
+        dd["events"] = [int(t * BPS) for t, _ in BURSTS]
+    nb = len(d) // B
+    if rmode == "fd":
+        sf = [(b0, np.fft.rfft(m, N)) for b0, m in model]
+        Rall = np.array([seq_at(sf, i) * np.fft.rfft(dd["xq"][i * B + B:i * B + B + N]) for i in range(nb)])
+    else:
+        rq = np.concatenate([np.zeros(N), r])
+        Rall = np.array([np.fft.rfft(rq[i * B + B:i * B + B + N]) for i in range(nb)])
+    saved, T.PI_DEFS = T.PI_DEFS, []                # the pi statistics are not used by any rule here (0.6 s per build)
+    try:
+        st = T.Stats(dd, Rall)
+    finally:
+        T.PI_DEFS = saved
+    st.Fsf = np.array([sf_factor(st.Srr[i], st.Pbar[i], st.eps[i], SF_EPS) for i in range(len(Rall))])
+    return dd, Rall, st
+
+
+# The minimum-phase factor F of the SF direction depends only on the reference statistics of the block, so it is the
+# same for every rule and every call in a condition.  It is computed once per block at build time (same code as
+# specfac.sf_dir) and looked up by the position of the Srr row; any call that does not match is computed as before.
+SF_EPS = 1e-2
+EXACT_OUTPUT = os.environ.get("ANC_EXACT") == "1"    # set ANC_EXACT=1 to reproduce vssT_lib.simulate bit for bit
+_SF_ORIG = p.SFm.sf_dir
+_SF_CACHE = [None]
+
+
+def sf_factor(Srr, Pbar, s_eps, eps_reg):
+    Lam = np.maximum(Srr + s_eps + eps_reg * Pbar, 1e-300)
+    full = np.concatenate([Lam, Lam[-2:0:-1]])
+    c = np.fft.ifft(0.5 * np.log(full)).real
+    c[1:N // 2] *= 2.0
+    c[N // 2 + 1:] = 0.0
+    return np.exp(np.fft.rfft(c))
+
+
+def sf_dir_cached(R, E, Srr, Pbar, s_eps, eps_reg, trunc=p.SFm.TRUNC, ret_y=False):
+    st = _SF_CACHE[0]
+    if st is None or eps_reg != SF_EPS or Srr.base is not st.Srr:
+        return _SF_ORIG(R, E, Srr, Pbar, s_eps, eps_reg, trunc, ret_y)
+    offset = Srr.ctypes.data - st.Srr.ctypes.data
+    i, remainder = divmod(offset, st.Srr.strides[0])
+    if (remainder or Srr.shape != st.Srr.shape[1:] or Srr.strides != st.Srr.strides[1:]
+            or not 0 <= i < len(st.Pbar) or Pbar != st.Pbar[i] or s_eps != st.eps[i]):
+        return _SF_ORIG(R, E, Srr, Pbar, s_eps, eps_reg, trunc, ret_y)
+    F_ = st.Fsf[i]
+    x = np.fft.irfft(np.conj(R) * E / np.conj(F_), N)
+    x[trunc:] = 0.0
+    G_ = np.fft.rfft(x) / F_
+    if ret_y:
+        return np.fft.irfft(G_, N)[:M], x, F_
+    return np.fft.irfft(G_, N)[:M]
+
+
+p.SFm.sf_dir = sf_dir_cached
+
+
+def seq_at(seq, i):
+    out = seq[0][1]
+    for b0, v in seq:
+        if i >= b0:
+            out = v
+    return out
+
+
+# ----------------------------------------------------------------------------------------------
+# Block simulator for the rules (arithmetic of vssT_lib.simulate; time-varying plant and model)
+# ----------------------------------------------------------------------------------------------
+def fir_block(hist, yb, h):
+    """Output of the FIR h for the block yb, given hist = the len(hist) samples before it (len(hist) >= len(h) - 1)."""
+    seg = np.concatenate([hist[len(hist) - (len(h) - 1):], yb])
+    return sliding_window_view(seg, len(h)) @ h[::-1]
+
+
+def filtered_block(states, i, hist, yb, seq):
+    """Initialize lfilter history against the new impulse response at a switch."""
+    h = seq_at(seq, i)
+    old_h, zi = states
+    if h is not old_h:
+        zi = np.zeros(len(h) - 1)
+        if len(zi):
+            _, zi = p.signal.lfilter(h, [1.0], hist[-len(zi):], zi=zi)
+    if EXACT_OUTPUT:
+        out, zi = p.signal.lfilter(h, [1.0], yb, zi=zi)
+        return out, (h, zi)
+    # Same FIR and outgoing state as lfilter, with a different summation order.
+    full = np.convolve(h, yb)
+    full[:len(zi)] += zi
+    return full[:len(yb)], (h, full[len(yb):])
+
+
+def diverged(eb, primary_power):
+    power = float(np.mean(eb ** 2))
+    return not np.isfinite(power) or power > DIV_GAIN * primary_power
+
+
+def simulate(dd, Rall, st, rule, nb=None, error_frame=None, hook=None):
+    d, xq = dd["d"], dd["xq"]
+    nbmax = min(len(d) // B, len(Rall)); nb = nbmax if nb is None else min(nb, nbmax)
+    swv = sliding_window_view(xq, M)
+    w = np.zeros(M); e_all = np.zeros(nb * B); y_all = np.zeros_like(e_all)
+    Lh = max(max(len(h) for _, h in dd["hS_seq"]), max(len(h) for _, h in dd["hSm_seq"]))
+    hist = np.zeros(Lh - 1)
+    pref = dd.get("primary_power", float(np.mean(d ** 2)))
+    div = False; n_done = nb; failure = None
+    plant_state = model_state = (None, None)
+    same_model = (len(dd["hSm_seq"]) == len(dd["hS_seq"])
+                  and all(b == c and np.array_equal(h, m)
+                          for (b, h), (c, m) in zip(dd["hS_seq"], dd["hSm_seq"])))
+    for i in range(nb):
+        s0 = i * B
+        if EXACT_OUTPUT:                            # the product of vssT_lib.simulate (bit-for-bit)
+            yb = swv[s0 + N - M + 1:s0 + N - M + 1 + B][:, ::-1] @ w
+        else:                                       # the same sum by np.convolve: 6x faster, differs by rounding only
+            yb = np.convolve(xq[s0 + N - M + 1:s0 + N + B], w, "valid")
+        y_all[s0:s0+B] = yb
+        ys, plant_state = filtered_block(plant_state, i, hist, yb, dd["hS_seq"])
+        eb = d[s0:s0 + B] + ys
+        e_all[s0:s0 + B] = eb
+        if error_frame is None:
+            E = p.ML.frame_E(e_all, s0, M)
+        else:
+            if same_model:
+                ym = ys
+            else:
+                ym, model_state = filtered_block(model_state, i, hist, yb, dd["hSm_seq"])
+            E = error_frame(i, w, e_all, ym)
+        if hist.size and (len(dd["hS_seq"]) > 1 or len(dd["hSm_seq"]) > 1):
+            hist = np.concatenate([hist, yb])[-hist.size:]
+        c = T.Ctx(i, Rall[i], E, st, w)
+        rule.mu_formula(i)
+        mu, dv = rule.block(i, c)
+        if hook is not None:
+            hook(i, c, eb, mu)
+        w = c.w_override if c.w_override is not None else w - 2 * mu * B / M * dv
+        div = not np.isfinite(w).all() or diverged(eb, pref)
+        if div:
+            failure = dict(error_peak(e_all, s0), sample=s0 + B - 1)
+            e_all[s0:] = np.nan; n_done = i
+            break
+    return dict(e=e_all, y=y_all, w=w, div=div, nb=nb, n_done=n_done, failure=failure, ex=np.full(nb, np.nan), tr=rule.traces())
+
+
+class SFfix(p.Rule):
+    """SF direction with a fixed step (no 1/g, no early phase, no restart), ordinary error frame."""
+
+    def __init__(s, mu):
+        super().__init__(); s.mu = float(mu); s.trials = []; s.restarts = []
+
+    def block(s, i, c):
+        s.tr["mu_app"].append(s.mu)
+        return s.mu, p.SFm.sf_dir(c.R, c.E, c.Srr, c.Pbar, c.eps, 1e-2)
+
+
+class AlwaysTrial(q5.P5):
+    """Reuse P5 judgment and re-arm on each decision block, without rsN2."""
+
+    def block(self, i, c):
+        mu, dv = super().block(i, c)
+        if self.bg is None:
+            foreground = c.w if c.w_override is None else c.w_override
+            self.bg = dict(block=i, w=foreground.copy())
+            self.trials.append(dict(block=i, decide=None, rho=None, ok=None, status="pending"))
+        return mu, dv
+
+
+GE_CAP = 0.55      # floor of g in steps taken on rebuilt frames: a = s h / g <= 0.25 / 0.55 = 0.455 (< 0.47, E7: 0/20)
+
+
+class _CapMixin:
+    """Floor GE_CAP on g for the early step (foreground early phase and background trial); late step unchanged.
+    Without it the floor is GMIN = 0.25, so the early step can reach a = 1.0, above the measured limit 0.55-0.625."""
+
+    def block(s, i, c):
+        g0 = c.g
+        early = s.in_early(i)
+        bg = getattr(s, "bg", None)
+        capped = early or bg is not None
+        if capped:
+            c.g = max(g0, GE_CAP)
+        try:
+            mu, dv = super().block(i, c)
+        finally:
+            c.g = g0
+        rolled = s.tr.get("rollback", [False])[-1]
+        if capped and not early and dv is not None and c.w_override is None and not rolled:
+            mu = s.late / max(g0, s.gmin)
+            s.tr["mu_app"][-1] = mu
+        bg_updated = bg is not None and s.bg is bg
+        s.tr.setdefault("mu_bg_app", []).append(s.c["mu_e"] / max(g0, GE_CAP, s.gmin) if bg_updated else np.nan)
+        return mu, dv
+
+
+class P5Cap(_CapMixin, q5.P5):
+    pass
+
+
+class P4Cap(_CapMixin, q4.P4):
+    pass
+
+
+class AlwaysTrialCap(_CapMixin, AlwaysTrial):
+    pass
+
+
+class SwitchedFrame(q4.Frame4):
+    """Use each sample's active model for the synthesis of frozen errors."""
+
+    def __init__(self, data, rule, always=False):
+        super().__init__(data, rule)
+        self.always = always
+        self.references = [(block * B, np.pad(r, (2 * M - 1, 0)))
+                           for block, r in data["filtered"]]
+
+    def __call__(self, i, w, e_all, ys):
+        self.end, self.e_all = (i + 1) * B, e_all
+        self.sec[:-B] = self.sec[B:]
+        self.sec[-B:] = ys
+        seg = e_all[max(0, self.end - M):self.end]
+        self.energy = float(seg @ seg)
+        if not (self.always or self.rule.in_early(i)):
+            return p.ML.frame_E(e_all, i * B, M)
+        self.n_rebuilt += 1
+        rebuilt = self.trial_frame(w)
+        frame = np.zeros(N)
+        frame[-len(rebuilt):] = rebuilt
+        return np.fft.rfft(frame)
+
+    def trial_frame(self, w):
+        end = self.end
+        start = max(0, end - M)
+        for switch, reference in reversed(self.references):
+            if switch <= start:
+                self.ref = reference
+                break
+        result = super().trial_frame(w)
+        for switch, reference in self.references:
+            if start < switch < end:
+                self.ref = reference
+                result[switch - start:] = super().trial_frame(w)[switch - start:]
+        return result
+
+
+def run_rule(label, dd, Rall, st, X4, nb=None, hook=None):
+    nbr = min(len(dd["d"]) // B, len(Rall)) if nb is None else nb
+    frame = True
+    if label in ("P5-early", "P5-early-noG", "TP-always"):
+        cfg = q5.config(early_ok=(4, 0.25))
+        if label == "TP-always":
+            cfg["restart"] = False
+            rule = AlwaysTrial(cfg, dd, nbr, X4)
+        else:
+            rule = q5.P5(cfg, dd, nbr, X4)
+        if label == "P5-early-noG":
+            st = copy.copy(st); st.g = np.ones_like(st.g)
+    elif label == "P4":
+        rule = q4.P4(q4.config(K=16, win="B", abort=4.0), dd, nbr, X4)
+    elif label == "P5-early-cap":
+        rule = P5Cap(q5.config(early_ok=(4, 0.25)), dd, nbr, X4)
+    elif label in ("nors-cap", "ND-always-cap"):
+        rule = P4Cap(q4.config(restart=False), dd, nbr, X4)
+    elif label == "P4-cap":
+        rule = P4Cap(q4.config(K=16, win="B", abort=4.0), dd, nbr, X4)
+    elif label == "TP-always-cap":
+        cfg = q5.config(early_ok=(4, 0.25)); cfg["restart"] = False
+        rule = AlwaysTrialCap(cfg, dd, nbr, X4)
+    elif label in ("nors", "ND-always"):
+        rule = q4.P4(q4.config(restart=False), dd, nbr, X4)
+    elif label == "SF-fix":
+        rule = SFfix(q.mu_late(0.03)); frame = False
+    else:
+        raise ValueError(label)
+    if frame:
+        nd = label in ("ND-always", "ND-always-cap")
+        rule.frame = SwitchedFrame(dd, rule, always=nd) if len(dd["hSm_seq"]) > 1 or nd else q4.Frame4(dd, rule)
+    t0 = time.perf_counter()
+    _SF_CACHE[0] = st if hasattr(st, "Fsf") and not os.environ.get("ANC_NO_SFCACHE") else None
+    try:
+        sim = simulate(dd, Rall, st, rule, nb=nb, error_frame=rule.frame if frame else None, hook=hook)
+    finally:
+        _SF_CACHE[0] = None
+    sim["seconds"] = time.perf_counter() - t0
+    return rule, sim
+
+
+# ----------------------------------------------------------------------------------------------
+# Per-sample simulator for the external methods
+# ----------------------------------------------------------------------------------------------
+BLOCK_BASE = ("FreqFxLMS", "Freq_FxNLMS_CohVSS")     # update their coefficients once per B samples
+
+
+def run_baseline_block(name, mu, params, dd, n_tot=None):
+    """run_baseline for the block methods: the coefficients are constant inside a block, so the control output and
+    the acoustic path are computed per block; the method's own update is still called once per sample."""
+    x, d = dd["x"], dd["d"]
+    T_ = len(d) if n_tot is None else min(n_tot, len(d))
+    model = dd["hSm_seq"]
+    par = dict(params); par.setdefault("c_impulse", model[0][1]); par.setdefault("order_control", M)
+    algo = make_algo(name, par)
+    assert algo.BlockSize == B and T_ % B == 0
+    mswitch = {b0: m for b0, m in model[1:]}
+    Lh = max(len(h) for _, h in dd["hS_seq"]); hist = np.zeros(Lh - 1); state = (None, None)
+    multi = len(dd["hS_seq"]) > 1
+    w = np.zeros(M); e = np.zeros(T_)
+    pref = dd.get("primary_power", float(np.mean(d ** 2))); div = False; n_done = T_; failure = None
+    one = [0.0]
+    t0 = time.perf_counter()
+    for i in range(T_ // B):
+        s0 = i * B
+        if i in mswitch and hasattr(algo, "Hc"):
+            algo.Hc = np.fft.rfft(mswitch[i], n=algo.N)
+        yb = np.convolve(dd["xq"][s0 + N - M + 1:s0 + N + B], w, "valid")
+        ys, state = filtered_block(state, i, hist, yb, dd["hS_seq"])
+        if multi and hist.size:
+            hist = np.concatenate([hist, yb])[-hist.size:]
+        eb = d[s0:s0 + B] + ys
+        e[s0:s0 + B] = eb
+        invalid = np.flatnonzero(~np.isfinite(eb))
+        ok = not invalid.size
+        prefix = B - 1 if ok else int(invalid[0])
+        xb = x[s0:s0 + B]
+        # Before the final sample, update only the two duplicated ring buffers.
+        assert algo.count == 0
+        step = np.arange(prefix)
+        for buf, head, length, vals in ((algo.x2, algo.x_head, algo.N, xb), (algo.e2, algo.e_head, algo.M, eb)):
+            idx = (head + step) % length
+            buf[idx] = vals[:prefix]
+            buf[idx + length] = vals[:prefix]
+        algo.x_head = (algo.x_head + prefix) % algo.N
+        algo.e_head = (algo.e_head + prefix) % algo.M
+        algo.count = prefix
+        if ok:
+            one[0] = xb[-1]
+            w, _ = algo.update(w, eb[-1], None, one, mu)
+        if not ok or diverged(eb, pref) or not np.isfinite(w).all():
+            div = True; n_done = s0
+            failure = dict(error_peak(e, n_done), sample=s0 + prefix)
+            e[n_done:] = np.nan
+            break
+    return dict(e=e, w=w, div=div, n_done=n_done, failure=failure, seconds=time.perf_counter() - t0)
+
+
+def run_baseline(name, mu, params, dd, n_tot=None):
+    if name in fastbase.KIND and fastbase.HAVE_NUMBA and not os.environ.get("ANC_NO_JIT"):
+        pref = dd.get("primary_power", float(np.mean(dd["d"] ** 2)))
+        e, w, div, n_done, fail_n, sec = fastbase.run(name, mu, params, dd, n_tot, M, B, pref, DIV_GAIN)
+        failure = None
+        if div:
+            failure = dict(error_peak(e, n_done), sample=fail_n)
+            e[n_done:] = np.nan
+        return dict(e=e, w=w, div=div, n_done=n_done, failure=failure, seconds=sec)
+    available = len(dd["d"])
+    count = available if n_tot is None else min(n_tot, available)
+    if (name in BLOCK_BASE and not os.environ.get("ANC_NO_JIT") and count % B == 0
+            and params.get("BlockSize", params.get("M", 1024)) == B
+            and params.get("M", 1024) >= B):
+        return run_baseline_block(name, mu, params, dd, n_tot)
+    x, d, r = dd["x"], dd["d"], dd["r"]
+    T_ = count
+    model = dd["hSm_seq"]; plant = [(b0 * B, h[::-1].copy()) for b0, h in dd["hS_seq"]]
+    par = dict(params); par.setdefault("c_impulse", model[0][1]); par.setdefault("order_control", M)
+    algo = make_algo(name, par)
+    xr = np.concatenate([x[:T_][::-1], np.zeros(M - 1)])        # xr[T_-1-n : T_-1-n+M] = x[n], x[n-1], ...
+    rr = np.concatenate([r[:T_][::-1], np.zeros(M - 1)])
+    L = max(len(h) for _, h in plant)
+    y2 = np.zeros(2 * L); head = 0
+    w = np.zeros(M); e = np.zeros(T_)
+    hrev = plant[0][1]; lh = len(hrev)
+    switches = {n0: h for n0, h in plant[1:]}
+    mswitch = {b0 * B: m for b0, m in model[1:]}
+    pref = dd.get("primary_power", float(np.mean(d ** 2))); div = False; n_done = T_; failure = None
+    t0 = time.perf_counter()
+    for n in range(T_):
+        if n in switches:
+            hrev = switches[n]; lh = len(hrev)
+        if n in mswitch and hasattr(algo, "Hc"):
+            algo.Hc = np.fft.rfft(mswitch[n], n=algo.N)
+        a = T_ - 1 - n
+        xv = xr[a:a + M]; rv = rr[a:a + M]
+        y = float(w @ xv)
+        y2[head] = y; y2[head + L] = y
+        head = head + 1 if head + 1 < L else 0
+        en = d[n] + float(y2[head + L - lh:head + L] @ hrev)
+        e[n] = en
+        finite = math.isfinite(en)
+        if finite:
+            w, _ = algo.update(w, en, rv, xv, mu)
+        if not finite or ((n + 1) % B == 0
+                                  and (diverged(e[n + 1 - B:n + 1], pref) or not np.isfinite(w).all())):
+            div = True; n_done = n // B * B
+            failure = dict(error_peak(e, n_done), sample=n)
+            e[n_done:] = np.nan
+            break
+    return dict(e=e, w=w, div=div, n_done=n_done, failure=failure, seconds=time.perf_counter() - t0)
+
+
+# ----------------------------------------------------------------------------------------------
+# Measures
+# ----------------------------------------------------------------------------------------------
+def ratio_db(e, d, lo, hi):
+    return float(10 * np.log10(np.sum(e[lo:hi] ** 2) / np.sum(d[lo:hi] ** 2)))
+
+
+def recovery(e, cb, target_power, win=16, hold=BPS):
+    """Start of the first sustained run below twice the post-only error power."""
+    nb = len(e) // B
+    power = np.mean(e[:nb * B].reshape(nb, B) ** 2, axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(power[cb:])])
+    limit = target_power * 10 ** (3 / 10)
+    ok = (cumulative[win:] - cumulative[:-win]) / win <= limit
+    cnt = 0
+    for j, accept in enumerate(ok):
+        cnt = cnt + 1 if accept else 0
+        if cnt >= hold:
+            return j - hold + win
+    return None
+
+
+def measures(sim, dd, post=None):
+    e, d = sim["e"], dd["d"][:len(sim["e"])]
+    out = dict(div=int(bool(sim["div"])), seconds=round(float(sim["seconds"]), 2))
+    if sim["div"]:
+        out["div_block"] = int(sim["n_done"] if "nb" in sim else sim["n_done"] // B)
+        out["failure"] = sim["failure"]
+        return out
+    anr = p.O.anr_curve(e, d); ts = (63 + 64 * np.arange(len(anr))) / FS
+    win = lambda a, b: float(anr[(ts >= a) & (ts < b)].mean())
+    tend = len(e) / FS
+    out.update(L1_whole=float(anr.mean()), L1_last10=win(max(0.0, tend - 10), tend), L2_last5=ratio_db(e, d, len(e) - 5 * FS, len(e)))
+    ev = [b / BPS for b in (dd["changes"] or dd["events"]) if b / BPS + 2 <= tend]
+    if ev:
+        out["L1_ev"] = float(np.mean([win(t, t + 2) for t in ev]))
+        out["L1_pre"] = float(np.mean([win(t - 2, t) for t in ev]))
+    if dd["changes"] and post is not None and not post["div"]:
+        ep = post["e"]
+        target = float(np.mean(ep[-5 * FS:] ** 2))
+        cb = dd["changes"][0]
+        rec = recovery(e, cb, target)
+        out.update(rec_target=target, rec_blocks=rec, rec_cens=int(rec is None),
+                   rec_limit=max(0, len(e) // B - cb - BPS + 1))
+    return out
+
+
+def trial_stats(rule, dd):
+    tr = getattr(rule, "trials", None) or []
+    ch = dd["changes"]
+    true = lambda t: any(cb <= t["block"] < cb + p.RS_TRUE_WIN for cb in ch)
+    conf = [t for t in tr if t["status"] == "confirmed"]
+    scored = getattr(rule, "det", None) is not None or isinstance(rule, AlwaysTrial)
+    rs = p.restart_stats([t["block"] for t in conf], ch, dd.get("scored_blocks", len(dd["d"]) // B))
+    false_blocks = set(rs["false_blocks"])
+    def trial_row(t):
+        rho = t.get("rho")
+        return dict(block=t["block"], decide=t.get("decide"), status=t["status"],
+                    rho=rho if rho is None or math.isfinite(rho) else str(rho),
+                    false=t["block"] in false_blocks)
+    return dict(trials=[trial_row(t) for t in tr], n_trial=len(tr), n_confirm=len(conf), false_confirm=rs["n_false"],
+                missed=rs["n_missed"] if scored else None,
+                detection_blocks=[t["block"] for t in tr if true(t)],
+                decide_blocks=[t["decide"] - t["block"] for t in conf if true(t) and t.get("decide") is not None])
+
+
+# ----------------------------------------------------------------------------------------------
+# Jobs
+# ----------------------------------------------------------------------------------------------
+PILOT_CLASSES = ("G", "a145", "II300") + REAL
+PILOT_SCEN = ("stat", "RS-near", "RS-far", "RM-10", "RM-10s", "EN0")
+PILOT_SEEDS = (10, 11)
+PILOT_LS = (256, 512)
+POST_FOR = ("RS-near", "RS-far", "RM-10", "RM-10s")
+
+
+def out_dir(smoke):
+    return HERE / "out" / ("final_pilot2_smoke" if smoke else "final_pilot2")
+
+
+def run_job(job):
+    cls, scen, seed, Ls, smoke = job
+    f = out_dir(smoke) / f"{cls}_{scen}_s{seed}_L{Ls}.json"
+    if f.exists() and json.loads(f.read_text()).get("version") == VERSION:
+        return
+    t0 = time.monotonic()
+    X4 = p.parse(["c5", "--preset", "final"]).X4
+    nb = 20 * BPS if smoke else None
+    n_tot = None if nb is None else nb * B
+    with_post = scen in POST_FOR and not smoke
+    rows = []
+    data = {m: build(cls, scen, seed, Ls, m) for m in RMODES}
+    posts = {m: build(cls, "post:" + scen, seed, Ls, m) for m in RMODES} if with_post else {}
+    ref = {}
+    for rmode in RMODES:
+        dd, Rall, st = data[rmode]
+        for label in RULES:
+            rule, sim = run_rule(label, dd, Rall, st, X4, nb)
+            post = None
+            if with_post:
+                pd_, pR, pst = posts[rmode]
+                _, ps = run_rule(label, pd_, pR, pst, X4, nb)
+                post = dict(e=ps["e"], d=pd_["d"][:len(ps["e"])], div=ps["div"])
+            row = dict(method=label, kind="rule", rmode=rmode, **measures(sim, dd, post),
+                       **trial_stats(rule, dict(dd, scored_blocks=sim["n_done"])))
+            if post is not None:
+                row["post_div"] = int(post["div"])
+                row["post_seconds"] = ps["seconds"]
+                row["post_failure"] = ps["failure"]
+            if label == "nors":
+                ref[rmode] = (sim["e"], sim["y"])
+            elif rmode in ref and not sim["div"]:
+                if np.isfinite(ref[rmode][0]).all():
+                    diff = float(np.max(np.abs(sim["e"] - ref[rmode][0])))
+                    speaker = float(np.max(np.abs(sim["y"] - ref[rmode][1])))
+                    different = (sim["e"] != ref[rmode][0]) | (sim["y"] != ref[rmode][1])
+                    row.update(same_as_nors=int(diff == 0 and speaker == 0),
+                               max_diff_nors=diff, max_diff_y_nors=speaker,
+                               first_diff_sample=int(np.argmax(different)) if different.any() else None)
+            rows.append(row)
+    dd = data["fd"][0]
+    for name, (mu, par) in BASE.items():
+        sim = run_baseline(name, mu, par, dd, n_tot)
+        post = None
+        if with_post:
+            pd_ = posts["fd"][0]
+            ps = run_baseline(name, mu, par, pd_, n_tot)
+            post = dict(e=ps["e"], d=pd_["d"][:len(ps["e"])], div=ps["div"])
+        row = dict(method=name, kind="base", rmode="-", mu=mu, **measures(sim, dd, post))
+        if post is not None:
+            row.update(post_div=int(post["div"]), post_seconds=ps["seconds"], post_failure=ps["failure"])
+        rows.append(row)
+    for r in rows:
+        r.update(cls=cls, scen=scen, seed=int(seed), Ls=int(Ls))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    ab.atomic_write(f, lambda h: json.dump(dict(version=VERSION, rows=rows, wall_seconds=time.monotonic()-t0), h))
+    print(f"{f.stem}: {len(rows)} rows, div={sum(r['div'] for r in rows)}, {time.monotonic() - t0:.0f} s", flush=True)
+
+
+# ----------------------------------------------------------------------------------------------
+# S1c: floor on g for the early step (design seeds 10-14, S-hat 256, rules only)
+# ----------------------------------------------------------------------------------------------
+CAP_RULES = ("nors", "P5-early", "nors-cap", "P5-early-cap")
+CAP_REF = {"P5-early": "nors", "P5-early-cap": "nors-cap"}
+CAP_SEEDS = (10, 11, 12, 13, 14)
+CAP_DIR = HERE / "out" / "final_cap"
+CAP_VERSION = 1
+H_STEP = 0.25                                   # h = (2B/M)(M_e/N); a = mu_app * h
+
+
+
+def cap_steps(tr):
+    mu = np.asarray(tr["mu_app"], float)
+    early = np.asarray(tr["early"], bool)
+    adaptive = ~(np.asarray(tr.get("rollback", np.zeros(len(mu))), bool)
+                 | np.asarray(tr.get("transfer", np.zeros(len(mu))), bool))
+    def maximum(values):
+        return float(np.max(values) * H_STEP) if len(values) else None
+    bg = np.array(tr.get("mu_bg_app", []))
+    return dict(a_max_early=maximum(mu[early & adaptive]), a_max_late=maximum(mu[~early & adaptive]),
+                a_max_bg=maximum(bg[np.isfinite(bg)]))
+
+def cap_dir(Ls):
+    return CAP_DIR if Ls == 256 else HERE / "out" / f"final_cap{Ls}"
+
+
+def run_cap_job(job):
+    cls, scen, seed, Ls = job
+    f = cap_dir(Ls) / f"{cls}_{scen}_s{seed}.json"
+    if f.exists():
+        cached = json.loads(f.read_text())
+        if cached.get("version") == CAP_VERSION and cached.get("Ls", 256) == Ls:
+            return
+    t0 = time.monotonic()
+    X4 = p.parse(["c5", "--preset", "final"]).X4
+    dd, Rall, st = build(cls, scen, seed, Ls)
+    post = build(cls, "post:" + scen, seed, Ls) if scen in POST_FOR else None
+    rows, ref = [], {}
+    for label in CAP_RULES:
+        rule, sim = run_rule(label, dd, Rall, st, X4)
+        pm = None
+        if post is not None:
+            _, ps = run_rule(label, post[0], post[1], post[2], X4)
+            pm = dict(e=ps["e"], d=post[0]["d"][:len(ps["e"])], div=ps["div"])
+        row = dict(method=label, cls=cls, scen=scen, seed=int(seed), **measures(sim, dd, pm),
+                   **trial_stats(rule, dict(dd, scored_blocks=sim["n_done"])))
+        row.update(cap_steps(sim["tr"]))
+        row["g_min32"] = float(np.min(st.g[:min(32, len(sim["tr"]["mu_app"]))]))
+        if pm is not None:
+            row["post_div"] = int(pm["div"])
+        ref[label] = sim
+        r0 = ref.get(CAP_REF.get(label))
+        if r0 is not None and not sim["div"] and not r0["div"]:
+            row["same_as_ref"] = int(all(np.array_equal(sim[k], r0[k]) for k in ("e", "y")))
+        rows.append(row)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    ab.atomic_write(f, lambda h: json.dump(dict(version=CAP_VERSION, Ls=Ls, rows=rows), h))
+    print(f"{f.stem}: div={[r['div'] for r in rows]}, {time.monotonic() - t0:.0f} s", flush=True)
+
+
+def cap(procs, Ls=256):
+    jobs = [(c, s, sd, Ls) for c in PILOT_CLASSES for s in PILOT_SCEN for sd in CAP_SEEDS]
+    with Pool(procs) as pool:
+        list(pool.imap_unordered(run_cap_job, jobs))
+    files = [json.loads((cap_dir(Ls) / f"{c}_{s}_s{sd}.json").read_text()) for c, s, sd, _ in jobs]
+    if any(f["version"] != CAP_VERSION or f.get("Ls", 256) != Ls or tuple(r["method"] for r in f["rows"]) != CAP_RULES for f in files):
+        raise ValueError("Incomplete or stale S1c results")
+    rows = [r for f in files for r in f["rows"]]
+
+    def med(values):
+        if not values:
+            return "—"
+        mid = float(np.median(values))
+        return "打切" if np.isinf(mid) else fmt(mid, 1)
+
+    stage = "S1c" if Ls == 256 else "S1d"
+    L = [f"# {stage}：前半のステップに使う g の下限（設計用 seed 10–14、Ŝ {Ls}）", "",
+         f"cap = 作り直した誤差で進む更新（前半と裏の試行）だけ g の下限を {GE_CAP} にする（a ≤ {0.25 / GE_CAP:.3f}）。後半は変更なし。",
+         "表は自動生成。L1 は完走した実行の平均（dB）。rec は回復までのブロック数の中央値（打ち切りを含む）。", ""]
+    for scen in PILOT_SCEN:
+        L += [f"## {scen}", "", "| 手法 | 試行 | 発散 | L1 whole | L1 last10 | L1 直後2秒 | rec 中央値 | 打切 | 誤確定 | 見逃し | 基準と一致 | a 最大（前半） |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for m in CAP_RULES:
+            rm = [r for r in rows if r["scen"] == scen and r["method"] == m]; ok = [r for r in rm if not r["div"]]
+            recs = [float("inf") if r["rec_blocks"] is None else r["rec_blocks"] for r in ok if r.get("rec_cens") is not None]
+            cnt = lambda k: "—" if all(r.get(k) is None for r in rm) else str(sum(r.get(k) or 0 for r in rm))
+            am = [r["a_max_early"] for r in rm if r.get("a_max_early") is not None]
+            L.append(f"| {m} | {len(rm)} | {sum(r['div'] for r in rm)} | {fmt(agg(ok, 'L1_whole'))} | {fmt(agg(ok, 'L1_last10'))} | {fmt(agg(ok, 'L1_ev'))} | "
+                     f"{med(recs)} | {sum(v == float('inf') for v in recs) if recs else '—'} | {cnt('false_confirm')} | {cnt('missed')} | "
+                     f"{cnt('same_as_ref')}/{sum(r.get('same_as_ref') is not None for r in ok)} | {fmt(max(am), 3) if am else '—'} |")
+        L.append("")
+    L += ["## 発散した実行", "", "| クラス | 条件 | seed | 手法 | 発散ブロック | a 最大（前半） | g 最小（先頭32ブロック） |", "|---|---|---:|---|---:|---:|---:|"]
+    L += [f"| {r['cls']} | {r['scen']} | {r['seed']} | {r['method']} | {r.get('div_block', '—')} | {fmt(r.get('a_max_early'), 3)} | {fmt(r.get('g_min32'), 3)} |"
+          for r in rows if r["div"]]
+    L += ["", "## 対応のある差（cap − 変更前、両方完走した実行）", "", "| 組 | 条件 | L1 whole の差 | L1 直後2秒の差 | whole / 直後 対数 | 回復差（ブロック） | 回復対数 |", "|---|---|---:|---:|---:|---:|---:|"]
+    key = lambda r: (r["cls"], r["scen"], r["seed"])
+    for a, b in (("nors-cap", "nors"), ("P5-early-cap", "P5-early")):
+        for scen in PILOT_SCEN + ("全条件",):
+            A = {key(r): r for r in rows if r["method"] == a and not r["div"] and scen in (r["scen"], "全条件")}
+            Bm = {key(r): r for r in rows if r["method"] == b and not r["div"] and scen in (r["scen"], "全条件")}
+            ks = sorted(set(A) & set(Bm))
+            dif = lambda k_: [A[k][k_] - Bm[k][k_] for k in ks if A[k].get(k_) is not None and Bm[k].get(k_) is not None]
+            L.append(f"| {a} − {b} | {scen} | {fmt(float(np.mean(dif('L1_whole'))) if dif('L1_whole') else None, 3)} | "
+                     f"{fmt(float(np.mean(dif('L1_ev'))) if dif('L1_ev') else None, 3)} | {len(ks)} / {len(dif('L1_ev'))} | "
+                     f"{fmt(float(np.mean(dif('rec_blocks'))) if dif('rec_blocks') else None, 1)} | {len(dif('rec_blocks'))} |")
+    L += ["", "## クラスごとの a 最大（前半、変更前の P5-early）と発散", "", "| クラス | a 最大 | a>0.55 の実行 | 発散（P5-early） | 発散（P5-early-cap） |", "|---|---:|---:|---:|---:|"]
+    for c in PILOT_CLASSES:
+        rc = [r for r in rows if r["cls"] == c and r["method"] == "P5-early"]; am = [r["a_max_early"] for r in rc if r.get("a_max_early") is not None]
+        L.append(f"| {c} | {fmt(max(am), 3) if am else '—'} | {sum(v > 0.55 for v in am)}/{len(am)} | {sum(r['div'] for r in rc)} | "
+                 f"{sum(r['div'] for r in rows if r['cls'] == c and r['method'] == 'P5-early-cap')} |")
+    name = "RESULTS_final_cap.md" if Ls == 256 else f"RESULTS_final_cap{Ls}.md"
+    (HERE / name).write_text("\n".join(L) + "\n", encoding="utf-8")
+    print("wrote", name, len(rows), "rows")
+
+
+# ----------------------------------------------------------------------------------------------
+# S2: step sizes of the external methods (design seeds 10-14).  One setting per method for all conditions.
+# ----------------------------------------------------------------------------------------------
+LS_FINAL = 512
+TUNE_SCEN = ("stat", "RS-far")
+TUNE_SEEDS = (10, 11, 12, 13, 14)
+TUNE_FACTORS = (1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0, 2.0)          # x the published step
+TH_LIMITS = (5.0, 10.0, 20.0, 200.0)                                     # Th_FxNLMS: clipping level (200 = published)
+TUNE_DIR = HERE / "out" / "final_tune"
+TUNE_VERSION = 1
+
+
+def tune_grid(name):
+    mu0, par = BASE[name]
+    if name == "Th_FxNLMS":
+        return [(f"x{k:g}|c{c:g}", mu0 * k, dict(par, c1=-c, c2=c)) for c in TH_LIMITS for k in TUNE_FACTORS]
+    return [(f"x{k:g}", mu0 * k, dict(par)) for k in TUNE_FACTORS]
+
+
+def tune_case_path(cls, scen, seed):
+    return TUNE_DIR / f"{cls}_{scen}_s{seed}.json"
+
+
+def tune_case_rows(obj, cls, scen, seed):
+    expected = [(method, key, mu, cls, scen, seed)
+                for method in BASE for key, mu, _ in tune_grid(method)]
+    rows = obj.get("rows", [])
+    fields = ("method", "key", "mu", "cls", "scen", "seed")
+    if obj.get("version") != TUNE_VERSION or [tuple(r.get(k) for k in fields) for r in rows] != expected:
+        return None
+    return rows
+
+
+def run_tune_job(job):
+    cls, scen, seed = job
+    f = tune_case_path(cls, scen, seed)
+    if f.exists() and tune_case_rows(json.loads(f.read_text()), cls, scen, seed) is not None:
+        return
+    t0 = time.monotonic()
+    dd, _, _ = build(cls, scen, seed, LS_FINAL)
+    rows = []
+    for name in BASE:
+        for key, mu, par in tune_grid(name):
+            sim = run_baseline(name, mu, par, dd)
+            rows.append(dict(method=name, key=key, mu=mu, cls=cls, scen=scen, seed=int(seed), **measures(sim, dd)))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    ab.atomic_write(f, lambda h: json.dump(dict(version=TUNE_VERSION, rows=rows), h))
+    print(f"{f.stem}: {len(rows)} runs, div={sum(r['div'] for r in rows)}, {time.monotonic() - t0:.0f} s", flush=True)
+
+
+def class_mean(rows, key):
+    """Mean over classes of the per-class mean (classes weigh equally)."""
+    per = {}
+    for r in rows:
+        if r.get(key) is not None:
+            per.setdefault(r["cls"], []).append(r[key])
+    return float(np.mean([np.mean(v) for v in per.values()])) if per else None
+
+
+def tune(procs):
+    jobs = [(c, s, sd) for c in PILOT_CLASSES for s in TUNE_SCEN for sd in TUNE_SEEDS]
+    with Pool(procs) as pool:
+        list(pool.imap_unordered(run_tune_job, jobs))
+    rows = []
+    for c, s, sd in jobs:
+        case = tune_case_rows(json.loads(tune_case_path(c, s, sd).read_text()), c, s, sd)
+        if case is None:
+            raise ValueError(f"Incomplete tune cache: {c}/{s}/s{sd}")
+        rows.extend(case)
+    L = [f"# S2：外部手法のステップ探索（設計用 seed 10–14、Ŝ {LS_FINAL}、条件 {'・'.join(TUNE_SCEN)}）", "",
+         "選び方（事前に固定）：発散が最も少ない設定の中で、L1 whole のクラス平均（クラスを等しい重みで平均。完走した実行のみ）が最小のもの。"
+         "発散 0 件の設定がない手法は、その旨を示す。表は自動生成。", ""]
+    chosen, per_class = {}, {}
+    render_key = lambda key: key.replace("|", "\\|")
+    for name in BASE:
+        L += [f"## {name}", "", "| 設定 | ステップ | 発散 | L1 whole（クラス平均） | L1 last10 | L1 直後2秒 | 選択 |", "|---|---:|---:|---:|---:|---:|---|"]
+        cand = []
+        for key, mu, par in tune_grid(name):
+            rk = [r for r in rows if r["method"] == name and r["key"] == key]; ok = [r for r in rk if not r["div"]]
+            cand.append((sum(r["div"] for r in rk), class_mean(ok, "L1_whole") if ok else float("inf"), key, mu, par, ok))
+        best = min(cand, key=lambda c: (c[0], c[1]))
+        chosen[name] = dict(key=best[2], mu=best[3], params=best[4], div=best[0], L1_whole=best[1] if np.isfinite(best[1]) else None)
+        for ndiv, l1, key, mu, par, ok in cand:
+            L.append(f"| {render_key(key)} | {mu:.6g} | {ndiv} | {fmt(l1 if np.isfinite(l1) else None)} | {fmt(class_mean(ok, 'L1_last10'))} | "
+                     f"{fmt(class_mean(ok, 'L1_ev'))} | {'○' if key == best[2] else ''} |")
+        L.append("")
+        per_class[name] = {}
+        for c in PILOT_CLASSES:                 # the setting that is best for this class alone (upper bound for the method)
+            cc = []
+            for key, mu, par in tune_grid(name):
+                rk = [r for r in rows if r["method"] == name and r["key"] == key and r["cls"] == c]; ok = [r for r in rk if not r["div"]]
+                cc.append((sum(r["div"] for r in rk), agg(ok, "L1_whole") if ok else float("inf"), key, mu, par))
+            b = min(cc, key=lambda v: (v[0], v[1]))
+            per_class[name][c] = dict(key=b[2], mu=b[3], params=b[4], div=b[0], L1_whole=b[1] if np.isfinite(b[1]) else None)
+    L += ["## 選ばれた設定", "", "| 手法 | 設定 | ステップ | 発散 | L1 whole | 格子の端か |", "|---|---|---:|---:|---:|---|"]
+    for name, c in chosen.items():
+        fac = c["key"].split("|")[0]
+        edge = "下端" if fac == f"x{TUNE_FACTORS[0]:g}" else ("上端" if fac == f"x{TUNE_FACTORS[-1]:g}" else "")
+        L.append(f"| {name} | {render_key(c['key'])} | {c['mu']:.6g} | {c['div']} | {fmt(c['L1_whole'])} | {edge} |")
+    L += ["", "## クラスごとの最良の設定（補助表用。外部手法に有利な上限）", "", "| 手法 | " + " | ".join(PILOT_CLASSES) + " |", "|---|" + "---|" * len(PILOT_CLASSES)]
+    for name in BASE:
+        L.append(f"| {name} | " + " | ".join(f"{render_key(per_class[name][c]['key'])}（{fmt(per_class[name][c]['L1_whole'])}、発散 {per_class[name][c]['div']}）" for c in PILOT_CLASSES) + " |")
+    (HERE / "RESULTS_final_tune.md").write_text("\n".join(L) + "\n", encoding="utf-8")
+    ab.atomic_write(HERE / "TUNE.json", lambda h: json.dump(dict(Ls=LS_FINAL, hp_hz=HP_HZ, seeds=TUNE_SEEDS, scen=TUNE_SCEN, chosen=chosen,
+                                                                 per_class=per_class), h, indent=1, allow_nan=False))
+    print("wrote RESULTS_final_tune.md and TUNE.json", len(rows), "runs")
+
+
+def pilot(procs, smoke):
+    seeds = PILOT_SEEDS[:1] if smoke else PILOT_SEEDS
+    classes = ("G", "a145", "machinegun") if smoke else PILOT_CLASSES
+    scen = ("stat", "RS-far", "RM-10s") if smoke else PILOT_SCEN
+    jobs = [(c, s, sd, L, smoke) for L in (PILOT_LS[:1] if smoke else PILOT_LS) for c in classes for s in scen for sd in seeds]
+    if procs == 1:
+        for j in jobs:
+            run_job(j)
+    else:
+        with Pool(procs) as pool:
+            list(pool.imap_unordered(run_job, jobs))
+
+
+# ----------------------------------------------------------------------------------------------
+# Report
+# ----------------------------------------------------------------------------------------------
+def fmt(v, nd=2):
+    return "—" if v is None or (isinstance(v, float) and not np.isfinite(v)) else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
+
+
+def agg(rows, key):
+    v = [r[key] for r in rows if r.get(key) is not None]
+    return float(np.mean(v)) if v else None
+
+
+def report(smoke):
+    d = out_dir(smoke)
+    jobs = [json.loads(f.read_text()) for f in sorted(d.glob("*.json"))]
+    rows = [r for job in jobs if job["version"] == VERSION for r in job["rows"]]
+    if not rows:
+        raise ValueError(f"No pilot rows in {d}")
+    L = ["# 最終評価 S1b：100 Hz 高域通過を入れた試行（設計用 seed）", "",
+         "表は自動生成。値は dB（小さいほど良い）、発散した試行は平均から除き件数を示す。rec は回復までのブロック数の中央値"
+         "（打ち切りは件数で表示。打ち切りは観測上限より後として順位に含め、中央値が確定しない場合は「打切」）。", ""]
+    methods = list(RULES) + list(BASE)
+    for Ls in sorted({r["Ls"] for r in rows}):
+        for scen in PILOT_SCEN:
+            for rmode in RMODES:
+                rs = [r for r in rows if r["Ls"] == Ls and r["scen"] == scen and r["rmode"] in (rmode, "-" if rmode == "fd" else "")]
+                if not rs:
+                    continue
+                L += [f"## Ŝ {Ls} タップ、{scen}、参照 {rmode}", "",
+                      "| 手法 | 試行 | 発散 | L1 whole | L1 last10 | L1 直後2秒 | rec 中央値 | 打切 | 試行回数 | 誤確定 | 見逃し | nors と一致 | 秒 |",
+                      "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+                for m in methods:
+                    rm = [r for r in rs if r["method"] == m]
+                    if not rm:
+                        continue
+                    okr = [r for r in rm if not r["div"]]
+                    recs = [r for r in okr if "rec_cens" in r]
+                    if recs:
+                        vals = sorted(float("inf") if r["rec_blocks"] is None else r["rec_blocks"] for r in recs)
+                        med = (vals[(len(vals) - 1) // 2] + vals[len(vals) // 2]) / 2
+                        med = "打切" if med == float("inf") else f"{med:g}"
+                    else:
+                        med = "—"
+                    cnt = lambda k: "—" if all(r.get(k) is None for r in rm) else str(sum(r.get(k) or 0 for r in rm))
+                    L.append(f"| {m} | {len(rm)} | {sum(r['div'] for r in rm)} | {fmt(agg(okr, 'L1_whole'))} | {fmt(agg(okr, 'L1_last10'))} | "
+                             f"{fmt(agg(okr, 'L1_ev'))} | {med} | {sum(r['rec_cens'] for r in recs) if recs else '—'} | {cnt('n_trial')} | "
+                             f"{cnt('false_confirm')} | {cnt('missed')} | {cnt('same_as_nors')} | {fmt(agg(rm, 'seconds'), 1)} |")
+                L.append("")
+    L += ["## クラスごとの L1 last10（Ŝ ごと、stat、参照 fd）", ""]
+    for Ls in sorted({r["Ls"] for r in rows}):
+        classes = sorted({r["cls"] for r in rows})
+        L += [f"### Ŝ {Ls} タップ", "", "| 手法 | " + " | ".join(classes) + " |", "|---|" + "---:|" * len(classes)]
+        for m in methods:
+            cells = [fmt(agg([r for r in rows if r["Ls"] == Ls and r["scen"] == "stat" and r["method"] == m and r["cls"] == c
+                              and r["rmode"] in ("fd", "-") and not r["div"]], "L1_last10")) for c in classes]
+            L.append(f"| {m} | " + " | ".join(cells) + " |")
+        L.append("")
+    dest = (d if smoke else HERE) / "RESULTS_final_pilot2.md"
+    dest.write_text("\n".join(L), encoding="utf-8")
+    print("wrote", dest, len(rows), "rows")
+
+
+# ----------------------------------------------------------------------------------------------
+# Checks
+# ----------------------------------------------------------------------------------------------
+def check():
+    X4 = p.parse(["c5", "--preset", "final"]).X4
+    rng = np.random.default_rng(0)
+    # 1. Block FIR = lfilter, across a switch of the response.
+    h1, h2 = rng.standard_normal(300), rng.standard_normal(200); y = rng.standard_normal(6 * B)
+    hist = np.zeros(299); out = []
+    for i in range(6):
+        yb = y[i * B:(i + 1) * B]; out.append(fir_block(hist, yb, h1 if i < 3 else h2)); hist = np.concatenate([hist, yb])[-299:]
+    ref = np.concatenate([p.signal.lfilter(h1, [1.0], y)[:3 * B], p.signal.lfilter(h2, [1.0], y)[3 * B:]])
+    np.testing.assert_allclose(np.concatenate(out), ref, atol=1e-9)
+    for h in (h1, h2, h1[:1]):
+        zi = np.linspace(-1.0, 1.0, len(h) - 1)
+        expected, expected_state = p.signal.lfilter(h, [1.0], y[:B], zi=zi)
+        actual, (_, actual_state) = filtered_block((h, zi), 0, hist, y[:B], [(0, h)])
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+        np.testing.assert_allclose(actual_state, expected_state, atol=1e-12)
+    print("check 1 ok: block FIR with a switch")
+    # 2. Reserved seeds are refused.
+    try:
+        guard_seed(100)
+    except SystemExit:
+        print("check 2 ok: seeds 100-119 refused")
+    else:
+        raise AssertionError("seed guard")
+    # 3. Input power of the real recordings equals that of the Gaussian class.
+    pg = g_power()
+    for cls in REAL:
+        pm = float(np.mean(excitation(cls, 10) ** 2))
+        assert abs(pm / pg - 1) < 1e-9, (cls, pg, pm)
+    print(f"check 3 ok: input power {pg:.3f}")
+    # 4. Scenario bookkeeping.
+    dd, Rall, st = build("G", "RS-far", 10, 256)
+    assert dd["changes"] == [CB] and len(dd["hS_seq"]) == 1 and len(dd["hSm_seq"]) == 1
+    d2, _, _ = build("G", "RM-10", 10, 256); d3, _, _ = build("G", "RM-10s", 10, 256)
+    assert len(d2["hS_seq"]) == 2 and len(d2["hSm_seq"]) == 2 and len(d3["hSm_seq"]) == 1
+    dp, _, _ = build("G", "post:RS-far", 10, 256)
+    np.testing.assert_allclose(dp["d"][CB * B + 5000:CB * B + 6000], dd["d"][CB * B + 5000:CB * B + 6000], atol=1e-9)
+    print("check 4 ok: scenarios")
+    # 5. The block simulator and the per-sample simulator give the same error for frozen (zero) coefficients,
+    #    and both reduce the error on a short stationary run.
+    dd, Rall, st = build("G", "stat", 10, 256)
+    rule, sim = run_rule("P5-early", dd, Rall, st, X4, nb=600)
+    bs = run_baseline("FxNLMS", 0.3, {}, dd, 600 * B)
+    assert not sim["div"] and not bs["div"]
+    a = ratio_db(sim["e"], dd["d"], 500 * B, 600 * B); b = ratio_db(bs["e"], dd["d"], 500 * B, 600 * B)
+    assert a < -3 and b < -1, (a, b)
+    print(f"check 5 ok: after 4.8 s, P5-early {a:.2f} dB, FxNLMS {b:.2f} dB ({sim['seconds']:.1f} s, {bs['seconds']:.1f} s)")
+    # 6. Recovery measure on a hand-made curve.
+    d = np.ones(400 * B); e = np.full(400 * B, 0.1); e[100 * B:140 * B] = 1.0
+    assert recovery(e, 100, 0.01) == 55, recovery(e, 100, 0.01)      # first 16-block window after block 139
+    assert recovery(np.ones(400 * B), 100, 0.01) is None
+    print("check 6 ok: recovery", recovery(e, 100, 0.01))
+    # 7. Without a change and without bursts, P5-early equals the rule without restart unless a trial was confirmed.
+    rn, sn = run_rule("nors", dd, Rall, st, X4, nb=600)
+    if not rule.restarts:
+        np.testing.assert_allclose(sim["e"], sn["e"], rtol=1e-9, atol=1e-12)
+    print("check 7 ok: no confirmed trial -> same output as no restart; trials", [t["status"] for t in rule.trials])
+
+
+    # 8. Reference simulators on the repository's default paths.
+    standard, R0, st0 = q.prep("G_s10", 256)
+    standard.update(hS_seq=[(0, standard["hS"])], hSm_seq=[(0, standard["hS"])])
+    for label, cfg in (("nors", q4.config(restart=False)), ("P5-early", q5.config(early_ok=(4, 0.25)))):
+        reference = q4.run_p4 if label == "nors" else q5.run_p5
+        _, expected = reference(standard, R0, st0, cfg, 256, X4)
+        _, actual = run_rule(label, standard, R0, st0, X4, 256)
+        assert not actual["div"] and not expected["div"]
+        for key in ("e", "w"):
+            if EXACT_OUTPUT:
+                np.testing.assert_array_equal(actual[key], expected[key])
+            else:
+                diff = np.max(np.abs(actual[key] - expected[key]))
+                assert diff < 1e-12 * np.max(np.abs(expected[key])), (label, key, diff)
+    print("check 8 ok: vssT_lib default paths", "bitwise" if EXACT_OUTPUT else "relative error < 1e-12")
+
+    from anc import pad_or_trim, step_td
+    hP, hS = pad_or_trim(T.BS.hP, M), standard["hS"]
+    xvec, weights, yhist = np.zeros(M), np.zeros((1, M)), np.zeros((1, len(hS)))
+    rb, yc, ys = np.zeros((1, M)), np.zeros(1), np.zeros(1)
+    algo = make_algo("FxNLMS", {"order_control": M})
+    reference_e = np.empty(8 * B)
+    for i, x in enumerate(standard["x"][:len(reference_e)]):
+        d0 = step_td(float(x), xvec, weights, yhist, hP, hS, len(hS), rb, yc, ys)
+        reference_e[i] = d0 + ys[0]
+        weights[0], _ = algo.update(weights[0], reference_e[i], rb[0], xvec, 0.3)
+    actual = run_baseline("FxNLMS", 0.3, {}, standard, len(reference_e))
+    assert not actual["div"]
+    np.testing.assert_allclose(actual["e"], reference_e, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(actual["w"], weights[0], rtol=1e-10, atol=1e-10)
+    print("check 9 ok: FxNLMS agrees with anc.step_td; max error difference",
+          np.max(np.abs(actual["e"] - reference_e)))
+
+    # 10. Independent FIR reference at a model switch with a frozen controller.
+    x = rng.standard_normal(8 * B)
+    w = rng.standard_normal(M)
+    y = np.convolve(x, w)[:len(x)]
+    models = [(0, h1), (3, h2)]
+    refs = [(b, p.signal.lfilter(h, [1.0], x)) for b, h in models]
+    frame = SwitchedFrame(dict(r=refs[0][1], filtered=refs), None, always=True)
+    history = np.zeros(len(h1) - 1)
+    state = (None, None)
+    d_only = rng.standard_normal(len(x))
+    actual_e = d_only.copy()
+    expected_e = d_only + np.concatenate([p.signal.lfilter(h1, [1.0], y)[:3*B],
+                                           p.signal.lfilter(h2, [1.0], y)[3*B:]])
+    for i in range(8):
+        block = slice(i * B, (i + 1) * B)
+        secondary, state = filtered_block(state, i, history, y[block], models)
+        actual_e[block] += secondary
+        frame(i, w, actual_e, secondary)
+        np.testing.assert_allclose(frame.trial_frame(w), expected_e[max(0, (i+1)*B-M):(i+1)*B], atol=1e-9)
+        history = np.concatenate([history, y[block]])[-len(history):]
+    print("check 10 ok: model switch preserves frozen-error reconstruction")
+
+
+    # 11. Match every real input to filtered G and verify the high-pass response.
+    np.testing.assert_equal(g_power(), np.mean(excitation("G", 10) ** 2))
+    for cls in (*REAL, "G", "a145", "II300"):
+        raw = _excitation(cls, 10)
+        filtered = highpass(raw)
+        if cls in REAL:
+            filtered *= np.sqrt(g_power() / np.mean(filtered ** 2))
+        np.testing.assert_array_equal(excitation(cls, 10), filtered)
+    ts = np.arange(FS) / FS
+    tones = [np.sin(2 * np.pi * hz * ts) for hz in (40, 250)]
+    assert np.std(highpass(tones[0])[FS//2:]) < 0.02
+    assert np.std(highpass(tones[1])[FS//2:]) > 0.70
+    assert error_peak(tones[1], FS)["band"] == "250–500"
+    print("check 11 ok: filtered-G power, high-pass response and band diagnostic")
+
+
+    # 12. g above the cap leaves both foreground and trial arithmetic unchanged.
+    fixtures = ("nors", "P5-early")
+    dd, Rall, st = build("G", "RS-far", 10, 256)
+    above = copy.copy(st)
+    above.g = np.maximum(st.g, GE_CAP)
+    for label in (*fixtures, "P4", "TP-always", "ND-always"):
+        _, uncapped = run_rule(label, dd, Rall, above, X4, nb=CB + 160)
+        _, capped = run_rule(label + "-cap", dd, Rall, above, X4, nb=CB + 160)
+        assert not uncapped["div"] and not capped["div"]
+        np.testing.assert_array_equal(uncapped["e"], capped["e"])
+        np.testing.assert_array_equal(uncapped["tr"]["mu_app"], capped["tr"]["mu_app"])
+    print("check 12 ok: capped and uncapped errors and steps match exactly above the floor")
+
+    # 13. Force the floor to engage; compare logged adaptive steps with the formulas.
+    low = copy.copy(st)
+    low.g = st.g.copy()
+    low.g[:2] = 0.50
+    low.g[CB + 2] = 0.50
+    for label in (*fixtures, "P4", "TP-always", "ND-always"):
+        rule, sim = run_rule(label + "-cap", dd, Rall, low, X4, nb=CB + 160)
+        assert not sim["div"]
+        steps = cap_steps(sim["tr"])
+        np.testing.assert_allclose(steps["a_max_early"], H_STEP / GE_CAP)
+        if label in ("P5-early", "TP-always"):
+            np.testing.assert_allclose(steps["a_max_bg"], H_STEP / GE_CAP)
+        tr = sim["tr"]
+        late = (tr["early"] == 0) & (tr.get("transfer", np.zeros(len(tr["early"]))) == 0)
+        late &= np.asarray(tr.get("rollback", np.zeros(len(late)))) == 0
+        assert late.any()
+        np.testing.assert_array_equal(tr["mu_app"][late], rule.late / np.maximum(low.g[:len(late)][late], rule.gmin))
+    print("check 13 ok: foreground/background cap and original late-step log")
+
+    # 14. Inspect schedule and tuning dispatch without launching final jobs.
+    jobs = final_jobs(True)
+    assert len(jobs) == len(set(jobs)) == 240 and {j[2] for j in jobs} == set(DRY_SEEDS)
+    for n in (1, 7, 241):
+        parts = [j for k in range(n) for j in shard_jobs(jobs, parse_shard(f"{k}/{n}"))]
+        assert sorted(parts) == sorted(jobs)
+    for invalid in ("0/0", "-1/3", "3/3", "1", "1/2/3"):
+        try:
+            parse_shard(invalid)
+        except argparse.ArgumentTypeError:
+            continue
+        raise AssertionError(invalid)
+    tune_ = json.loads((HERE / "TUNE.json").read_text())
+    for name in BASE:
+        assert [v for v, _ in final_settings(tune_, name, "a120", "stat")] == ["main"]
+        for cls in FINAL_CLASSES:
+            main = tune_["chosen"][name]
+            local = tune_["per_class"][name].get(cls, main)
+            for scen in FINAL_SCEN:
+                expected = [("main", main)]
+                if scen in TUNE_SCEN and local["key"] != main["key"]:
+                    expected.append(("class", local))
+                assert list(final_settings(tune_, name, cls, scen)) == expected
+    assert recovery_summary([dict(div=0, rec_cens=0, rec_blocks=3),
+                             dict(div=0, rec_cens=1, rec_limit=10)]) == ("3", 1)
+    assert recovery_summary([dict(div=0, rec_cens=1, rec_limit=10)]) == ("打切", 1)
+    rows_b = [dict(cls=c, scen="stat", seed=sd, div=0, L1_whole=0.0)
+              for c, sd in (("G", 10), ("a145", 10), ("G", 11))]
+    rows_a = [dict(r, L1_whole=float(v)) for r, v in zip(rows_b, (2, 6, 12))]
+    assert paired(rows_a, rows_b, "L1_whole") == (8.0, 4.0, 12.0, 3)
+    print("check 14 ok: shard partition, tuning dispatch and recovery censoring")
+
+    # 15. Compare cached SF (including background and shallow-copy stats) to original SF.
+    short = 160
+    cache = _SF_CACHE[0]
+    try:
+        _SF_CACHE[0] = above
+        for row in (above.Srr[2], above.Srr[2].copy(), above.Srr[2, ::-1]):
+            args = (Rall[2], Rall[2], row, above.Pbar[2], above.eps[2], SF_EPS)
+            for actual, expected in zip(sf_dir_cached(*args, ret_y=True), _SF_ORIG(*args, ret_y=True)):
+                np.testing.assert_array_equal(actual, expected)
+    finally:
+        _SF_CACHE[0] = cache
+    original = os.environ.get("ANC_NO_SFCACHE")
+    try:
+        for label in ("TP-always-cap", "P5-early-noG"):
+            os.environ.pop("ANC_NO_SFCACHE", None)
+            _, cached = run_rule(label, dd, Rall, above, X4, nb=short)
+            os.environ["ANC_NO_SFCACHE"] = "1"
+            _, uncached = run_rule(label, dd, Rall, above, X4, nb=short)
+            np.testing.assert_array_equal(cached["e"], uncached["e"])
+            np.testing.assert_array_equal(cached["w"], uncached["w"])
+    finally:
+        if original is None:
+            os.environ.pop("ANC_NO_SFCACHE", None)
+        else:
+            os.environ["ANC_NO_SFCACHE"] = original
+    print("check 15 ok: cached SF matches original, including fallback and background")
+
+
+# ----------------------------------------------------------------------------------------------
+# S3: final evaluation.  --dry = the same pipeline on design seeds 10-12 (no reserved seed is touched).
+# ----------------------------------------------------------------------------------------------
+FINAL_CLASSES = ("G", "II300", "a145", "a120") + REAL
+FINAL_SCEN = ("stat", "RS-near", "RS-far", "RM-10", "RM-40", "RM-10s", "EN0", "ENm10")
+FINAL_RULES = ("nors-cap", "P5-early-cap", "P5-early-noG", "P4-cap", "TP-always-cap", "ND-always-cap", "SF-fix")
+FINAL_SEEDS = tuple(range(100, 120))
+DRY_SEEDS = (10, 11, 12)
+PROPOSED = "P5-early-cap"
+FINAL_VERSION = 2
+
+
+def final_dir(dry):
+    return HERE / "out" / ("final_dry" if dry else "final_run")
+
+
+def has_post(scen):
+    return scen.startswith(("RS-", "RM-"))
+
+
+def final_settings(tune, name, cls, scen):
+    main = tune["chosen"][name]
+    yield "main", main
+    if scen in TUNE_SCEN:
+        local = tune["per_class"][name].get(cls)
+        if local is not None and local["key"] != main["key"]:
+            yield "class", local
+
+
+def run_final_job(job):
+    cls, scen, seed, dry = job
+    if dry and seed not in DRY_SEEDS:
+        raise ValueError("invalid dry-run seed")
+    if not dry and (seed not in FINAL_SEEDS or not (HERE / "EVAL_FROZEN.json").is_file()):
+        raise SystemExit("final runs require a reserved seed and EVAL_FROZEN.json")
+    f = final_dir(dry) / f"{cls}_{scen}_s{seed}.json"
+    if f.exists() and json.loads(f.read_text()).get("version") == FINAL_VERSION:
+        return
+    t0 = time.monotonic()
+    tune_ = json.loads((HERE / "TUNE.json").read_text())
+    assert tune_["Ls"] == LS_FINAL and tune_["hp_hz"] == HP_HZ
+    X4 = p.parse(["c5", "--preset", "final"]).X4
+    dd, Rall, st = build(cls, scen, seed, LS_FINAL, final=not dry)
+    post = build(cls, "post:" + scen, seed, LS_FINAL, final=not dry) if has_post(scen) else None
+    prepared = time.monotonic()
+    rows, ref = [], None
+    for label in FINAL_RULES:
+        rule, sim = run_rule(label, dd, Rall, st, X4)
+        pm = None
+        if post is not None:
+            _, ps = run_rule(label, post[0], post[1], post[2], X4)
+            pm = dict(e=ps["e"], d=post[0]["d"][:len(ps["e"])], div=ps["div"])
+        row = dict(method=label, kind="rule", variant="main", **measures(sim, dd, pm),
+                   **trial_stats(rule, dict(dd, scored_blocks=sim["n_done"])))
+        if label == "nors-cap":
+            ref = sim
+        elif ref is not None and not sim["div"] and not ref["div"]:
+            row["max_output_diff"] = float(np.max(np.abs(sim["y"] - ref["y"])))
+            row["same_as_nors"] = int(row["max_output_diff"] == 0 and np.array_equal(sim["e"], ref["e"]))
+        rows.append(row)
+    rules_done = time.monotonic()
+    for name in BASE:
+        for variant, s_ in final_settings(tune_, name, cls, scen):
+            sim = run_baseline(name, s_["mu"], s_["params"], dd)
+            pm = None
+            if post is not None:
+                ps = run_baseline(name, s_["mu"], s_["params"], post[0])
+                pm = dict(e=ps["e"], d=post[0]["d"][:len(ps["e"])], div=ps["div"])
+            rows.append(dict(method=name, kind="base", variant=variant, key=s_["key"], mu=s_["mu"], **measures(sim, dd, pm)))
+    bases_done = time.monotonic()
+    for r in rows:
+        r.update(cls=cls, scen=scen, seed=int(seed))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    timings = dict(preparation=prepared - t0, rules=rules_done - prepared,
+                   baselines=bases_done - rules_done)
+    ab.atomic_write(f, lambda h: json.dump(dict(version=FINAL_VERSION, rows=rows,
+                                               wall_seconds=time.monotonic() - t0, timings=timings), h))
+    print(f"{f.stem}: {len(rows)} rows, div={sum(r['div'] for r in rows)}, {time.monotonic() - t0:.0f} s", flush=True)
+
+
+def final_jobs(dry):
+    return [(c, s, sd, dry) for sd in (DRY_SEEDS if dry else FINAL_SEEDS) for c in FINAL_CLASSES for s in FINAL_SCEN]
+
+
+def parse_shard(value):
+    try:
+        k, n = map(int, value.split("/"))
+        if 0 <= k < n:
+            return k, n
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("expected k/n with 0 <= k < n")
+
+
+def shard_jobs(jobs, shard):
+    k, n = shard
+    return jobs[k::n]
+
+
+def final_run(procs, dry, shard):
+    if not dry and not (HERE / "EVAL_FROZEN.json").is_file():
+        raise SystemExit("EVAL_FROZEN.json is required for the final run")
+    jobs = shard_jobs(final_jobs(dry), shard)
+    with Pool(procs) as pool:
+        list(pool.imap_unordered(run_final_job, jobs))
+
+
+def seed_table(rows, key):
+    """{seed: mean over classes of the per-class mean of key} for the rows given."""
+    out = {}
+    for sd in sorted({r["seed"] for r in rows}):
+        v = class_mean([r for r in rows if r["seed"] == sd], key)
+        if v is not None:
+            out[sd] = v
+    return out
+
+
+def paired(rows_a, rows_b, key, n_boot=2000):
+    """Mean and 95% interval (seeds resampled) of key(a) - key(b) over runs that both completed."""
+    idx = lambda rows: {(r["cls"], r["scen"], r["seed"]): r[key]
+                        for r in rows if not r["div"] and r.get(key) is not None}
+    A, Bm = idx(rows_a), idx(rows_b)
+    ks = sorted(set(A) & set(Bm))
+    if not ks:
+        return None
+    per_seed = {}
+    for k in ks:
+        c, _, sd = k
+        per_seed.setdefault(sd, {}).setdefault(c, []).append(A[k] - Bm[k])
+    vals = np.array([np.mean([np.mean(v) for v in per_seed[sd].values()]) for sd in sorted(per_seed)])
+    rng = np.random.default_rng(0)
+    boot = rng.choice(vals, size=(n_boot, len(vals)), replace=True).mean(axis=1)
+    return float(vals.mean()), float(np.quantile(boot, 0.025)), float(np.quantile(boot, 0.975)), len(ks)
+
+
+def recovery_summary(rows):
+    """Kaplan–Meier median and number of right-censored runs with a usable target."""
+    observations = {}
+    for row in rows:
+        censored = row.get("rec_cens")
+        if row["div"] or censored is None:
+            continue
+        time_ = row["rec_limit"] if censored else row["rec_blocks"]
+        counts = observations.setdefault(time_, [0, 0])
+        counts[int(censored)] += 1
+    if not observations:
+        return "—", "—"
+    at_risk = sum(sum(v) for v in observations.values())
+    censored = sum(v[1] for v in observations.values())
+    survival = 1.0
+    for time_, (events, censors) in sorted(observations.items()):
+        survival *= (at_risk - events) / at_risk
+        if survival <= 0.5 + 1e-12:
+            return str(time_), censored
+        at_risk -= events + censors
+    return "打切", censored
+
+
+def paired_text(v):
+    return "—" if v is None else f"{v[0]:+.2f} [{v[1]:+.2f}, {v[2]:+.2f}]（{v[3]}）"
+
+
+def final_report(dry):
+    jobs = final_jobs(dry); d = final_dir(dry)
+    missing = []
+    rows = []
+    for c, s, sd, _ in jobs:
+        path = d / f"{c}_{s}_s{sd}.json"
+        result = json.loads(path.read_text()) if path.is_file() else {}
+        if result.get("version") != FINAL_VERSION:
+            missing.append((c, s, sd))
+        else:
+            rows.extend(result["rows"])
+    title = "最終評価の予行（設計用 seed 10–12）" if dry else "最終評価（seed 100–119）"
+    L = [f"# {title}", "", f"Ŝ {LS_FINAL} タップ、高域通過 {HP_HZ:g} Hz、提案法 = {PROPOSED}。外部手法は TUNE.json の全条件共通の設定（main）。",
+         f"完了 {len(jobs) - len(missing)}/{len(jobs)} 条件。表は自動生成。L1 は seed 内の等重みクラス平均を seed 間で平均（完走分、dB）。"
+         "rec は打ち切りを含む Kaplan–Meier 中央値。回復差は両方で回復した対（ブロック）。"
+         "誤確定と見逃しには発散前の判定も含む。", ""]
+    def mean_l1(rs, key):
+        vals = list(seed_table(rs, key).values())
+        return float(np.mean(vals)) if vals else None
+
+    methods = list(FINAL_RULES) + list(BASE)
+    main = [r for r in rows if r["variant"] == "main"]
+    for scen in FINAL_SCEN:
+        rs = [r for r in main if r["scen"] == scen]
+        if not rs:
+            continue
+        L += [f"## {scen}", "", "| 手法 | 試行 | 発散 | L1 whole | L1 last10 | L1 直後2秒 | rec 中央値 | 打切 | 誤確定 | 見逃し | nors-cap と一致 | 最大出力差 | 提案 − 当手法：L1 whole [95%] | 同：直後2秒 [95%] | 同：回復 [95%] |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|"]
+        prop = [r for r in rs if r["method"] == PROPOSED]
+        for m in methods:
+            rm = [r for r in rs if r["method"] == m]; ok = [r for r in rm if not r["div"]]
+            med, censored = recovery_summary(rm)
+            cnt = lambda k: "—" if all(r.get(k) is None for r in rm) else str(sum(r.get(k) or 0 for r in rm))
+            same = [r["same_as_nors"] for r in ok if r.get("same_as_nors") is not None]
+            max_diff = max((r["max_output_diff"] for r in ok if "max_output_diff" in r), default=None)
+            pd_ = lambda key: paired_text(None if m == PROPOSED else paired(prop, rm, key))
+            L.append(f"| {m} | {len(rm)} | {sum(r['div'] for r in rm)} | {fmt(mean_l1(ok, 'L1_whole'))} | {fmt(mean_l1(ok, 'L1_last10'))} | "
+                     f"{fmt(mean_l1(ok, 'L1_ev'))} | {med} | {censored} | {cnt('false_confirm')} | {cnt('missed')} | "
+                     f"{(str(sum(same)) + '/' + str(len(same))) if same else '—'} | "
+                     f"{'—' if max_diff is None else format(max_diff, '.6g')} | {pd_('L1_whole')} | {pd_('L1_ev')} | {pd_('rec_blocks')} |")
+        L.append("")
+    L += ["## クラスごとの L1 whole（stat、main）", "", "| 手法 | " + " | ".join(FINAL_CLASSES) + " |", "|---|" + "---:|" * len(FINAL_CLASSES)]
+    for m in methods:
+        L.append(f"| {m} | " + " | ".join(fmt(agg([r for r in main if r["scen"] == "stat" and r["method"] == m and r["cls"] == c and not r["div"]], "L1_whole"))
+                                          for c in FINAL_CLASSES) + " |")
+    for scen in filter(has_post, FINAL_SCEN):
+        L += ["", f"## クラスごとの回復の中央値（{scen}、main。括弧は打ち切りの件数）", "", "| 手法 | " + " | ".join(FINAL_CLASSES) + " |", "|---|" + "---:|" * len(FINAL_CLASSES)]
+        for m in methods:
+            cells = []
+            for c in FINAL_CLASSES:
+                rc = [r for r in main if r["scen"] == scen and r["method"] == m and r["cls"] == c and not r["div"] and r.get("rec_cens") is not None]
+                med, censored = recovery_summary(rc)
+                cells.append("—" if censored == "—" else f"{med}（{censored}）")
+            L.append(f"| {m} | " + " | ".join(cells) + " |")
+    L += ["", "## 補助表：外部手法をクラスごとの最良の設定にした場合（stat と RS-far。未探索の a120 は共通設定。提案法も共通設定）", "",
+          "| 条件 | 手法 | 発散 | L1 whole | L1 直後2秒 | rec 中央値 | 打切 | 提案 − 当手法：L1 whole [95%] |", "|---|---|---:|---:|---:|---:|---:|---|"]
+    for scen in TUNE_SCEN:
+        prop = [r for r in main if r["scen"] == scen and r["method"] == PROPOSED]
+        for m in BASE:
+            best = {}
+            for r in rows:
+                if r["scen"] == scen and r["method"] == m:
+                    k = (r["cls"], r["seed"])
+                    if k not in best or r["variant"] == "class":
+                        best[k] = r
+            rm = list(best.values()); ok = [r for r in rm if not r["div"]]
+            med, censored = recovery_summary(rm)
+            L.append(f"| {scen} | {m} | {sum(r['div'] for r in rm)} | {fmt(mean_l1(ok, 'L1_whole'))} | {fmt(mean_l1(ok, 'L1_ev'))} | "
+                     f"{med} | {censored} | {paired_text(paired(prop, rm, 'L1_whole'))} |")
+    L += ["", "## 計算時間（1 実行あたりの平均、秒）", "", "| 手法 | 秒 |", "|---|---:|"]
+    L += [f"| {m} | {fmt(agg([r for r in main if r['method'] == m], 'seconds'), 2)} |" for m in methods]
+    name = "RESULTS_final_dry.md" if dry else "RESULTS_final.md"
+    (HERE / name).write_text("\n".join(L) + "\n", encoding="utf-8")
+    print("wrote", name, len(rows), "rows; missing", len(missing))
+
+
+def main():
+    a = argparse.ArgumentParser()
+    a.add_argument("cmd", choices=("check", "pilot", "report", "cap", "tune", "final", "final-report"))
+    a.add_argument("--dry", action="store_true")
+    a.add_argument("--shard", default="0/1", type=parse_shard, help="k/n: run the jobs with index k modulo n")
+    a.add_argument("--ls", type=int, default=256, choices=(256, 512))
+    a.add_argument("--procs", type=int, default=os.cpu_count() or 1)
+    a.add_argument("--smoke", action="store_true")
+    o = a.parse_args()
+    if o.cmd == "check":
+        check()
+    elif o.cmd == "pilot":
+        pilot(o.procs, o.smoke)
+    elif o.cmd == "cap":
+        cap(o.procs, o.ls)
+    elif o.cmd == "tune":
+        tune(o.procs)
+    elif o.cmd == "final":
+        final_run(o.procs, o.dry, o.shard)
+    elif o.cmd == "final-report":
+        final_report(o.dry)
+    else:
+        report(o.smoke)
+
+
+if __name__ == "__main__":
+    main()

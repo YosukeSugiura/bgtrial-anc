@@ -1,0 +1,26 @@
+{
+  "title": "Background trial filter for active impulsive noise control",
+  "upload_type": "software",
+  "license": "MIT",
+  "description": "Code and aggregated results for Y. Sugiura, \"Fast Reconvergence in Active Impulsive Noise Control Using a Background Trial Filter,\" submitted to APSIPA Transactions on Signal and Information Processing.",
+  "creators": [
+    {
+      "name": "Sugiura, Yosuke",
+      "affiliation": "Meiji University",
+      "orcid": "0000-0002-8415-4482"
+    }
+  ],
+  "keywords": [
+    "active noise control",
+    "impulsive noise",
+    "FxNLMS",
+    "reconvergence"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "10.5281/zenodo.10852693",
+      "relation": "references",
+      "scheme": "doi"
+    }
+  ]
+}
